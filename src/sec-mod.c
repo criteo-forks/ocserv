@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/un.h>
+#include <sys/sysinfo.h>
 #include <common.h>
 #include <syslog.h>
 #include <main.h>
@@ -48,6 +49,8 @@
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
 #include <gnutls/abstract.h>
+
+#include "thpool/thpool.h"
 
 #define MAINTAINANCE_TIME 310
 
@@ -592,8 +595,11 @@ static void send_stats_to_main(sec_mod_st *sec)
 		sec->last_stats_reset = now;
 	}
 
-	msg.secmod_client_entries = sec_mod_client_db_elems(sec);
-	msg.secmod_tlsdb_entries = sec->tls_db.entries;
+	pthread_mutex_lock(&sec->tls_db_mutex);
+	unsigned int db_entries = sec->tls_db.entries;
+	pthread_mutex_unlock(&sec->tls_db_mutex);
+
+	msg.secmod_tlsdb_entries = db_entries;
 	msg.secmod_auth_failures = sec->auth_failures;
 	msg.secmod_avg_auth_time = sec->avg_auth_time;
 	msg.secmod_max_auth_time = sec->max_auth_time;
@@ -602,7 +608,6 @@ static void send_stats_to_main(sec_mod_st *sec)
 
 	/* the following two are not resettable */
 	msg.secmod_client_entries = sec_mod_client_db_elems(sec);
-	msg.secmod_tlsdb_entries = sec->tls_db.entries;
 
 	ret = send_msg(sec, sec->cmd_fd, CMD_SECM_STATS, &msg,
 			(pack_size_func) secm_stats_msg__get_packed_size,
@@ -647,9 +652,13 @@ static void check_other_work(sec_mod_st *sec)
 		}
 
 		sec_mod_client_db_deinit(sec);
+		pthread_mutex_lock(&sec->tls_db_mutex);
 		tls_cache_deinit(&sec->tls_db);
+		pthread_mutex_unlock(&sec->tls_db_mutex);
 		talloc_free(sec->config_pool);
 		talloc_free(sec->sec_mod_pool);
+		pthread_mutex_destroy(&sec->client_db_mutex);
+		pthread_mutex_destroy(&sec->tls_db_mutex);
 		exit(0);
 	}
 
@@ -857,6 +866,43 @@ static int load_keys(sec_mod_st *sec, unsigned force)
 	return 0;
 }
 
+
+struct worker_connection_t {
+	int cfd;
+	sec_mod_st * sec;
+	int return_code;
+};
+
+void handle_worker_request(void * arg) {
+	uid_t uid;
+	pid_t pid;
+	struct worker_connection_t * connection = (struct worker_connection_t *)arg;
+
+	/* do not allow unauthorized processes to issue commands
+	 */
+	int ret = check_upeer_id("sec-mod", GETPCONFIG(connection->sec)->debug, connection->cfd,
+				 GETPCONFIG(connection->sec)->uid, GETPCONFIG(connection->sec)->gid,
+				 &uid, &pid);
+	if (ret < 0) {
+		seclog(connection->sec, LOG_INFO, "rejected unauthorized connection");
+	} else {
+		/* we do a new allocation, to also use it as pool for the
+		 * parsers to use */
+		unsigned buffer_size = MAX_MSG_SIZE;
+		uint8_t * buffer = talloc_size(connection->sec, buffer_size);
+		if (buffer == NULL) {
+			seclog(connection->sec, LOG_ERR, "error in memory allocation");
+			exit(1);
+		}
+
+		memset(buffer, 0, buffer_size);
+		serve_request_worker(connection->sec, connection->cfd, pid, buffer, buffer_size);
+		talloc_free(buffer);
+	}
+	close(connection->cfd);
+	connection->return_code = ret;
+}
+
 /* sec_mod_server:
  * @config: server configuration
  * @socket_file: the name of the socket
@@ -894,14 +940,15 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	socklen_t sa_len;
 	int cfd, ret, e, n;
 	unsigned buffer_size;
-	uid_t uid;
 	uint8_t *buffer;
 	int sd;
 	sec_mod_st *sec;
 	void *sec_mod_pool;
 	vhost_cfg_st *vhost = NULL;
 	fd_set rd_set;
-	pid_t pid;
+	struct worker_connection_t connection;
+	int nprocs = get_nprocs();
+	threadpool thpool;
 #ifdef HAVE_PSELECT
 	struct timespec ts;
 #else
@@ -936,6 +983,7 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	sec->sec_mod_pool = sec_mod_pool;
 	memcpy((uint8_t*)sec->hmac_key, hmac_key, hmac_key_length);
 
+	pthread_mutex_init(&sec->tls_db_mutex, NULL);
 	tls_cache_init(sec, &sec->tls_db);
 	sup_config_init(sec);
 
@@ -965,6 +1013,8 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 		seclog(sec, LOG_ERR, "error in client db initialization");
 		exit(1);
 	}
+
+	pthread_mutex_init(&sec->client_db_mutex, NULL);
 
 	sd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sd == -1) {
@@ -1009,6 +1059,11 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	alarm(MAINTAINANCE_TIME);
 	seclog(sec, LOG_INFO, "sec-mod initialized (socket: %s)", SOCKET_FILE);
 
+	// Initialize the thread pool with same number of threads as the number of cores of the machine.
+	// TODO: add a configuration option to customize the number of threads.
+	nprocs = get_nprocs();
+	thpool = thpool_init(nprocs);
+	seclog(sec, LOG_INFO, "sec-mod initialized thread pool with %d threads", nprocs);
 
 	for (;;) {
 		check_other_work(sec);
@@ -1088,18 +1143,16 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 			}
 			set_cloexec_flag (cfd, 1);
 
-			/* do not allow unauthorized processes to issue commands
-			 */
-			ret = check_upeer_id("sec-mod", GETPCONFIG(sec)->debug, cfd,
-					     GETPCONFIG(sec)->uid, GETPCONFIG(sec)->gid,
-					     &uid, &pid);
-			if (ret < 0) {
-				seclog(sec, LOG_INFO, "rejected unauthorized connection");
-			} else {
-				memset(buffer, 0, buffer_size);
-				serve_request_worker(sec, cfd, pid, buffer, buffer_size);
+			connection.cfd = cfd;
+			connection.sec = sec;
+
+			seclog(sec, LOG_DEBUG, "sec-mod distribute request to thread pool");
+			ret = thpool_add_work(thpool, handle_worker_request, (void*)&connection);
+			if (ret){
+				seclog(sec, LOG_ERR,
+					   "sec-mod error enqueuing worker request: %s",
+					   strerror(ret));
 			}
-			close(cfd);
 		}
  cont:
 		talloc_free(buffer);

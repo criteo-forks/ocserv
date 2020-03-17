@@ -250,6 +250,7 @@ AC_ARG_WITH(pam,
   test_for_pam=yes)
 
 pam_enabled=no
+LIBS="$LIBS -pthread"
 
 if test "$test_for_pam" = yes;then
 oldlibs=$LIBS

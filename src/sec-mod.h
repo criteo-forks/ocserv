@@ -21,6 +21,7 @@
 #ifndef SEC_MOD_H
 # define SEC_MOD_H
 
+#include <pthread.h>
 #include <gnutls/abstract.h>
 #include <ccan/htable/htable.h>
 #include <nettle/base64.h>
@@ -38,10 +39,13 @@ typedef struct sec_mod_st {
 	void *config_pool;
 	void *sec_mod_pool;
 
+	pthread_mutex_t client_db_mutex;
 	struct htable *client_db;
+
 	int cmd_fd;
 	int cmd_fd_sync;
 
+	pthread_mutex_t tls_db_mutex;
 	tls_sess_db_st tls_db;
 	uint64_t auth_failures; /* auth failures since the last update (SECM_CLI_STATS) we sent to main */
 	uint32_t max_auth_time; /* the maximum time spent in (sucessful) authentication */
@@ -129,6 +133,8 @@ typedef struct client_entry_st {
 
 	/* the vhost this user is associated with */
 	vhost_cfg_st *vhost;
+
+	pthread_mutex_t mutex;
 } client_entry_st;
 
 void *sec_mod_client_db_init(sec_mod_st *sec);

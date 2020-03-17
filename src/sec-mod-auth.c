@@ -467,12 +467,16 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 		return send_failed_session_open_reply(sec, fd);
 	}
 
+	pthread_mutex_lock(&e->mutex);
+
 	if (e->status != PS_AUTH_COMPLETED) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "session open received in unauthenticated client %s "SESSION_STR"!", e->acct_info.username, e->acct_info.safe_id);
 		return send_failed_session_open_reply(sec, fd);
 	}
 
 	if IS_CLIENT_ENTRY_EXPIRED(sec, e, time(0)) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "session expired; denied session for user '%s' "SESSION_STR, e->acct_info.username, e->acct_info.safe_id);
 		e->status = PS_AUTH_FAILED;
 		return send_failed_session_open_reply(sec, fd);
@@ -486,6 +490,7 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 	if (e->vhost->perm_config.acct.amod != NULL && e->vhost->perm_config.acct.amod->open_session != NULL && e->session_is_open == 0) {
 		ret = e->vhost->perm_config.acct.amod->open_session(e->vhost_acct_ctx, e->auth_type, &e->acct_info, req->sid.data, req->sid.len);
 		if (ret < 0) {
+			pthread_mutex_unlock(&e->mutex);
 			e->status = PS_AUTH_FAILED;
 			seclog(sec, LOG_INFO, "denied session for user '%s' "SESSION_STR, e->acct_info.username, e->acct_info.safe_id);
 			return send_failed_session_open_reply(sec, fd);
@@ -507,8 +512,10 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 		rep.ipv4_seed = hash_any(e->acct_info.username, strlen(e->acct_info.username), 0);
 	} else {
 		ret = gnutls_rnd(GNUTLS_RND_NONCE, &rep.ipv4_seed, sizeof(rep.ipv4_seed));
-		if (ret < 0)
+		if (ret < 0) {
+			pthread_mutex_unlock(&e->mutex);
 			return -1;
+		}
 	}
 
 	rep.sid.data = e->sid;
@@ -518,12 +525,14 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 
 	lpool = talloc_new(e);
 	if (lpool == NULL) {
+		pthread_mutex_unlock(&e->mutex);
 		return ERR_BAD_COMMAND; /* we desync */
 	}
 
 	if (e->vhost->config_module && e->vhost->config_module->get_sup_config) {
 		ret = e->vhost->config_module->get_sup_config(e->vhost->perm_config.config, e, &rep, lpool);
 		if (ret < 0) {
+			pthread_mutex_unlock(&e->mutex);
 			seclog(sec, LOG_ERR, "error reading additional configuration for '%s' "SESSION_STR, e->acct_info.username, e->acct_info.safe_id);
 			talloc_free(lpool);
 			return send_failed_session_open_reply(sec, fd);
@@ -534,6 +543,7 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 			(pack_size_func) secm_session_reply_msg__get_packed_size,
 			(pack_func) secm_session_reply_msg__pack);
 	if (ret < 0) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "error in sending session reply");
 		return ERR_BAD_COMMAND; /* we desync */
 	}
@@ -544,6 +554,7 @@ int handle_secm_session_open_cmd(sec_mod_st *sec, int fd, const SecmSessionOpenM
 	e->exptime = time(0) + e->vhost->perm_config.config->cookie_timeout + AUTH_SLACK_TIME;
 	e->in_use++;
 
+	pthread_mutex_unlock(&e->mutex);
 	return 0;
 }
 
@@ -567,7 +578,10 @@ int handle_secm_session_close_cmd(sec_mod_st *sec, int fd, const SecmSessionClos
 		                (pack_func) cli_stats_msg__pack);
 	}
 
+	pthread_mutex_lock(&e->mutex);
+
 	if (e->status < PS_AUTH_COMPLETED) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_DEBUG, "session close received in unauthenticated client %s "SESSION_STR"!", e->acct_info.username, e->acct_info.safe_id);
 		return send_msg(e, fd, CMD_SECM_CLI_STATS, &rep,
 		                (pack_size_func) cli_stats_msg__get_packed_size,
@@ -595,6 +609,7 @@ int handle_secm_session_close_cmd(sec_mod_st *sec, int fd, const SecmSessionClos
 			(pack_size_func) cli_stats_msg__get_packed_size,
 			(pack_func) cli_stats_msg__pack);
 	if (ret < 0) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "error in sending session stats");
 		return ERR_BAD_COMMAND;
 	}
@@ -603,7 +618,7 @@ int handle_secm_session_close_cmd(sec_mod_st *sec, int fd, const SecmSessionClos
 	stats_add_to(&e->saved_stats, &e->saved_stats, &e->stats);
 	memset(&e->stats, 0, sizeof(e->stats));
 	expire_client_entry(sec, e);
-
+	pthread_mutex_unlock(&e->mutex);
 	return 0;
 }
 
@@ -624,7 +639,9 @@ void handle_sec_auth_ban_ip_reply(sec_mod_st *sec, const BanIpReplyMsg *msg)
 	}
 
 	if (msg->reply != AUTH__REP__OK) {
+		pthread_mutex_lock(&e->mutex);
 		e->status = PS_AUTH_FAILED;
+		pthread_mutex_unlock(&e->mutex);
 	}
 
 	return;
@@ -647,7 +664,10 @@ int handle_sec_auth_stats_cmd(sec_mod_st * sec, const CliStatsMsg * req, pid_t p
 		return -1;
 	}
 
+	pthread_mutex_lock(&e->mutex);
+
 	if (e->status != PS_AUTH_COMPLETED) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "session stats received in unauthenticated client %s "SESSION_STR"!", e->acct_info.username, e->acct_info.safe_id);
 		return -1;
 	}
@@ -667,8 +687,10 @@ int handle_sec_auth_stats_cmd(sec_mod_st * sec, const CliStatsMsg * req, pid_t p
 	/* update PID */
 	e->acct_info.id = pid;
 
-	if (e->vhost->perm_config.acct.amod == NULL || e->vhost->perm_config.acct.amod->session_stats == NULL)
+	if (e->vhost->perm_config.acct.amod == NULL || e->vhost->perm_config.acct.amod->session_stats == NULL) {
+		pthread_mutex_unlock(&e->mutex);
 		return 0;
+	}
 
 	stats_add_to(&totals, &e->stats, &e->saved_stats);
 	if (req->remote_ip)
@@ -679,7 +701,7 @@ int handle_sec_auth_stats_cmd(sec_mod_st * sec, const CliStatsMsg * req, pid_t p
 		strlcpy(e->acct_info.ipv6, req->ipv6, sizeof(e->acct_info.ipv6));
 
 	e->vhost->perm_config.acct.amod->session_stats(e->vhost_acct_ctx, e->auth_type, &e->acct_info, &totals);
-
+	pthread_mutex_unlock(&e->mutex);
 	return 0;
 }
 
@@ -700,9 +722,12 @@ int handle_sec_auth_cont(int cfd, sec_mod_st * sec, const SecAuthContMsg * req)
 		return -1;
 	}
 
+	pthread_mutex_lock(&e->mutex);
+
 	if (e->status != PS_AUTH_INIT && e->status != PS_AUTH_CONT) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "auth cont received for %s "SESSION_STR" but we are on state %u!",
-		       e->acct_info.username, e->acct_info.safe_id, e->status);
+			   e->acct_info.username, e->acct_info.safe_id, e->status);
 		ret = -1;
 		goto cleanup;
 	}
@@ -710,6 +735,7 @@ int handle_sec_auth_cont(int cfd, sec_mod_st * sec, const SecAuthContMsg * req)
 	seclog(sec, LOG_DEBUG, "auth cont for user '%s' "SESSION_STR, e->acct_info.username, e->acct_info.safe_id);
 
 	if (req->password == NULL) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "no password given in auth cont for user '%s' "SESSION_STR,
 			e->acct_info.username, e->acct_info.safe_id);
 		ret = -1;
@@ -717,6 +743,7 @@ int handle_sec_auth_cont(int cfd, sec_mod_st * sec, const SecAuthContMsg * req)
 	}
 
 	if (e->module == NULL) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "no module available!");
 		ret = -1;
 		goto cleanup;
@@ -728,6 +755,7 @@ int handle_sec_auth_cont(int cfd, sec_mod_st * sec, const SecAuthContMsg * req)
 	    e->module->auth_pass(e->auth_ctx, req->password,
 			      strlen(req->password));
 	if (ret < 0) {
+		pthread_mutex_unlock(&e->mutex);
 		if (ret != ERR_AUTH_CONTINUE) {
 			seclog(sec, LOG_DEBUG,
 			       "error in password given in auth cont for user '%s' "SESSION_STR,
@@ -735,6 +763,8 @@ int handle_sec_auth_cont(int cfd, sec_mod_st * sec, const SecAuthContMsg * req)
 		}
 		goto cleanup;
 	}
+
+	pthread_mutex_unlock(&e->mutex);
 
  cleanup:
 	return handle_sec_auth_res(cfd, sec, e, ret);
@@ -810,8 +840,11 @@ int handle_sec_auth_init(int cfd, sec_mod_st *sec, const SecAuthInitMsg *req, pi
 		return -1;
 	}
 
+	pthread_mutex_lock(&e->mutex);
+
 	ret = set_module(sec, vhost, e, req->auth_type);
 	if (ret < 0) {
+		pthread_mutex_unlock(&e->mutex);
 		seclog(sec, LOG_ERR, "no module found for auth type %u", (unsigned)req->auth_type);
 		goto cleanup;
 	}
@@ -830,6 +863,7 @@ int handle_sec_auth_init(int cfd, sec_mod_st *sec, const SecAuthInitMsg *req, pi
 		if (ret == ERR_AUTH_CONTINUE) {
 			need_continue = 1;
 		} else if (ret < 0) {
+			pthread_mutex_unlock(&e->mutex);
 			goto cleanup;
 		}
 	}
@@ -881,11 +915,14 @@ int handle_sec_auth_init(int cfd, sec_mod_st *sec, const SecAuthInitMsg *req, pi
 	       e->acct_info.username, e->acct_info.safe_id, e->acct_info.groupname, req->ip);
 
 	if (need_continue != 0) {
+		pthread_mutex_unlock(&e->mutex);
 		ret = ERR_AUTH_CONTINUE;
 		goto cleanup;
 	}
 
 	ret = 0;
+	pthread_mutex_unlock(&e->mutex);
+
  cleanup:
 	return handle_sec_auth_res(cfd, sec, e, ret);
 }

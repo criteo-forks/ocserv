@@ -48,6 +48,7 @@ int handle_resume_delete_req(sec_mod_st *sec,
 
 	key = hash_any(req->session_id.data, req->session_id.len, 0);
 
+	pthread_mutex_lock(&sec->tls_db_mutex);
 	cache = htable_firstval(sec->tls_db.ht, &iter, key);
 	while (cache != NULL) {
 		if (req->session_id.len == cache->session_id_size &&
@@ -60,12 +61,14 @@ int handle_resume_delete_req(sec_mod_st *sec,
 			htable_delval(sec->tls_db.ht, &iter);
 			talloc_free(cache);
 			sec->tls_db.entries--;
+			pthread_mutex_unlock(&sec->tls_db_mutex);
 			return 0;
 		}
 
 		cache = htable_nextval(sec->tls_db.ht, &iter, key);
 	}
 
+	pthread_mutex_unlock(&sec->tls_db_mutex);
 	return 0;
 }
 
@@ -81,16 +84,21 @@ int handle_resume_fetch_req(sec_mod_st *sec,
 
 	key = hash_any(req->session_id.data, req->session_id.len, 0);
 
+	pthread_mutex_lock(&sec->tls_db_mutex);
 	cache = htable_firstval(sec->tls_db.ht, &iter, key);
 	while (cache != NULL) {
 		if (req->session_id.len == cache->session_id_size &&
 		    memcmp(req->session_id.data, cache->session_id,
 			   req->session_id.len) == 0) {
 
-			if (req->vhost && cache->vhostname && c_strcasecmp(req->vhost, cache->vhostname) != 0)
+			if (req->vhost && cache->vhostname && c_strcasecmp(req->vhost, cache->vhostname) != 0) {
+				pthread_mutex_unlock(&sec->tls_db_mutex);
 				return 0;
-			else if (req->vhost != cache->vhostname)
+			}
+			else if (req->vhost != cache->vhostname) {
+				pthread_mutex_unlock(&sec->tls_db_mutex);
 				return 0;
+			}
 
 			if (req->cli_addr.len == cache->remote_addr_len &&
 			    ip_cmp((struct sockaddr_storage *)req->cli_addr.data, &cache->remote_addr) == 0) {
@@ -100,10 +108,15 @@ int handle_resume_fetch_req(sec_mod_st *sec,
 
 				rep->has_session_data = 1;
 
-				rep->session_data.data =
-				    (void *)cache->session_data;
+				if (memcpy(rep->session_data.data, cache->session_data,
+					cache->session_data_size) == NULL) {
+					pthread_mutex_unlock(&sec->tls_db_mutex);
+					seclog(sec, LOG_ERR, "Unable to allocate memory for session data buffer")
+					return -1;
+				}
 				rep->session_data.len =
 				    cache->session_data_size;
+				pthread_mutex_unlock(&sec->tls_db_mutex);
 
 				seclog_hex(sec, LOG_DEBUG, "TLS session DB resuming",
 					  req->session_id.data,
@@ -115,9 +128,8 @@ int handle_resume_fetch_req(sec_mod_st *sec,
 
 		cache = htable_nextval(sec->tls_db.ht, &iter, key);
 	}
-
+	pthread_mutex_unlock(&sec->tls_db_mutex);
 	return 0;
-
 }
 
 int handle_resume_store_req(sec_mod_st *sec,
@@ -133,7 +145,10 @@ int handle_resume_store_req(sec_mod_st *sec,
 		return -1;
 
 	max = MAX(2 * GETCONFIG(sec)->max_clients, DEFAULT_MAX_CACHED_TLS_SESSIONS);
+
+	pthread_mutex_lock(&sec->tls_db_mutex);
 	if (sec->tls_db.entries >= max) {
+		pthread_mutex_unlock(&sec->tls_db_mutex);
 		seclog(sec, LOG_INFO,
 		      "maximum number of stored TLS sessions reached (%u)",
 		      max);
@@ -141,6 +156,7 @@ int handle_resume_store_req(sec_mod_st *sec,
 	}
 
 	if (req->cli_addr.len == 0) {
+		pthread_mutex_unlock(&sec->tls_db_mutex);
 		seclog(sec, LOG_INFO,
 		      "invalid address length");
 		return -1;
@@ -149,8 +165,10 @@ int handle_resume_store_req(sec_mod_st *sec,
 	key = hash_any(req->session_id.data, req->session_id.len, 0);
 
 	cache = talloc(sec->tls_db.ht, tls_cache_st);
-	if (cache == NULL)
+	if (cache == NULL) {
+		pthread_mutex_unlock(&sec->tls_db_mutex);
 		return -1;
+	}
 
 	cache->session_id_size = req->session_id.len;
 	cache->session_data_size = req->session_data.len;
@@ -168,10 +186,11 @@ int handle_resume_store_req(sec_mod_st *sec,
 	htable_add(sec->tls_db.ht, key, cache);
 	sec->tls_db.entries++;
 
+	pthread_mutex_unlock(&sec->tls_db_mutex);
+
 	seclog_hex(sec, LOG_DEBUG, "TLS session DB storing",
 				req->session_id.data,
 				req->session_id.len, 0);
-
 	return 0;
 }
 
@@ -183,6 +202,7 @@ void expire_tls_sessions(sec_mod_st *sec)
 
 	now = time(0);
 
+	pthread_mutex_lock(&sec->tls_db_mutex);
 	cache = htable_first(sec->tls_db.ht, &iter);
 	while (cache != NULL) {
 		gnutls_datum_t d;
@@ -203,6 +223,5 @@ void expire_tls_sessions(sec_mod_st *sec)
 		}
 		cache = htable_next(sec->tls_db.ht, &iter);
 	}
-
-	return;
+	pthread_mutex_unlock(&sec->tls_db_mutex);
 }

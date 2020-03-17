@@ -68,21 +68,23 @@ void *sec_mod_client_db_init(sec_mod_st *sec)
 
 void sec_mod_client_db_deinit(sec_mod_st *sec)
 {
-struct htable *db = sec->client_db;
+	struct htable *db = sec->client_db;
 
+	pthread_mutex_lock(&sec->client_db_mutex);
 	htable_clear(db);
 	talloc_free(db);
+	pthread_mutex_unlock(&sec->client_db_mutex);
 }
 
 /* The number of elements */
 unsigned sec_mod_client_db_elems(sec_mod_st *sec)
 {
-struct htable *db = sec->client_db;
+	struct htable *db = sec->client_db;
 
-	if (db)
-		return db->elems;
-	else
-		return 0;
+	pthread_mutex_lock(&sec->client_db_mutex);
+	unsigned elems = (db) ? db->elems : 0;
+	pthread_mutex_unlock(&sec->client_db_mutex);
+	return elems;
 }
 
 client_entry_st *new_client_entry(sec_mod_st *sec, struct vhost_cfg_st *vhost, const char *ip, unsigned pid)
@@ -125,12 +127,14 @@ client_entry_st *new_client_entry(sec_mod_st *sec, struct vhost_cfg_st *vhost, c
 	e->exptime = now + vhost->perm_config.config->cookie_timeout + AUTH_SLACK_TIME;
 	e->created = now;
 
+	pthread_mutex_lock(&sec->client_db_mutex);
 	if (htable_add(db, rehash(e, NULL), e) == 0) {
+		pthread_mutex_unlock(&sec->client_db_mutex);
 		seclog(sec, LOG_ERR,
 		       "could not add client entry to hash table");
 		goto fail;
 	}
-
+	pthread_mutex_unlock(&sec->client_db_mutex);
 	return e;
 
  fail:
@@ -155,7 +159,10 @@ client_entry_st *find_client_entry(sec_mod_st *sec, uint8_t sid[SID_SIZE])
 
 	memcpy(t.sid, sid, SID_SIZE);
 
-	return htable_get(db, rehash(&t, NULL), client_entry_cmp, &t);
+	pthread_mutex_lock(&sec->client_db_mutex);
+	client_entry_st * entry = htable_get(db, rehash(&t, NULL), client_entry_cmp, &t);
+	pthread_mutex_unlock(&sec->client_db_mutex);
+	return entry;
 }
 
 static void clean_entry(sec_mod_st *sec, client_entry_st * e)
@@ -172,6 +179,7 @@ void cleanup_client_entries(sec_mod_st *sec)
 	struct htable_iter iter;
 	time_t now = time(0);
 
+	pthread_mutex_lock(&sec->client_db_mutex);
 	t = htable_first(db, &iter);
 	while (t != NULL) {
 		if IS_CLIENT_ENTRY_EXPIRED_FULL(sec, t, now, 1) {
@@ -179,15 +187,17 @@ void cleanup_client_entries(sec_mod_st *sec)
 			clean_entry(sec, t);
 		}
 		t = htable_next(db, &iter);
-
 	}
+	pthread_mutex_unlock(&sec->client_db_mutex);
 }
 
 void del_client_entry(sec_mod_st *sec, client_entry_st * e)
 {
 	struct htable *db = sec->client_db;
 
+	pthread_mutex_lock(&sec->client_db_mutex);
 	htable_del(db, rehash(e, NULL), e);
+	pthread_mutex_unlock(&sec->client_db_mutex);
 	clean_entry(sec, e);
 }
 
