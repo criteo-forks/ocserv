@@ -295,6 +295,7 @@ struct cfg_st {
 	unsigned use_utmp;
 	unsigned tunnel_all_dns;
 	unsigned use_occtl; /* whether support for the occtl tool will be enabled */
+	unsigned secmod_threads;
 
 	unsigned try_mtu; /* MTU discovery enabled */
 	unsigned cisco_client_compat; /* do not require client certificate, 

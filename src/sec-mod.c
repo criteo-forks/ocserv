@@ -947,7 +947,7 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	vhost_cfg_st *vhost = NULL;
 	fd_set rd_set;
 	struct worker_connection_t connection;
-	int nprocs = get_nprocs();
+	int nprocs;
 	threadpool thpool;
 #ifdef HAVE_PSELECT
 	struct timespec ts;
@@ -1060,8 +1060,10 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	seclog(sec, LOG_INFO, "sec-mod initialized (socket: %s)", SOCKET_FILE);
 
 	// Initialize the thread pool with same number of threads as the number of cores of the machine.
-	// TODO: add a configuration option to customize the number of threads.
-	nprocs = get_nprocs();
+	nprocs = GETCONFIG(sec)->secmod_threads;
+	if (nprocs == 0) {
+		nprocs = get_nprocs();
+	}
 	thpool = thpool_init(nprocs);
 	seclog(sec, LOG_INFO, "sec-mod initialized thread pool with %d threads", nprocs);
 
