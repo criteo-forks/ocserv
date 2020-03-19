@@ -64,6 +64,8 @@ message group_cfg_st
 	optional string hostname = 40;
 	repeated string split_dns = 41;
 	optional uint32 secmod_threads = 42;
+	optional uint32 secmod_max_requests = 43;
+	optional bool secmod_drop_requests = 44;
 }
 
 /* AUTH_COOKIE_REP */

@@ -979,6 +979,10 @@ static int cfg_ini_handler(void *_ctx, const char *section, const char *name, co
 		READ_NUMERIC(config->max_same_clients);
 	} else if (strcmp(name, "secmod-threads") == 0) {
 		READ_NUMERIC(config->secmod_threads);
+	} else if (strcmp(name, "secmod-max-requests") == 0) {
+		READ_NUMERIC(config->secmod_max_requests);
+	} else if (strcmp(name, "secmod-drop-requests") == 0) {
+		READ_TF(config->secmod_drop_requests);
 	} else if (strcmp(name, "device") == 0) {
 		if (!WARN_ON_VHOST(vhost->name, "device", network.name))
 			READ_STATIC_STRING(config->network.name);

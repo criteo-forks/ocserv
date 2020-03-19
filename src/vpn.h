@@ -296,6 +296,12 @@ struct cfg_st {
 	unsigned tunnel_all_dns;
 	unsigned use_occtl; /* whether support for the occtl tool will be enabled */
 	unsigned secmod_threads;
+	unsigned secmod_max_requests; /* Configure the max number of requests secmod can enqueue before throttling
+								   * or dropping depending on the flag secmod_drop_requests.
+								   * This is a protection to avoid memory exhaustion in case of a DoS attack. */
+	unsigned secmod_drop_requests; /* If set to true, will simply drop messages when there are too many in order
+									* be able to quickly recover after an attack. If set to false, messages are
+									* throttled. */
 
 	unsigned try_mtu; /* MTU discovery enabled */
 	unsigned cisco_client_compat; /* do not require client certificate, 

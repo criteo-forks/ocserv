@@ -45,6 +45,7 @@
 #include <sec-mod-resume.h>
 #include <cloexec.h>
 #include <assert.h>
+#include <semaphore.h>
 
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
@@ -870,6 +871,7 @@ static int load_keys(sec_mod_st *sec, unsigned force)
 struct worker_connection_t {
 	int cfd;
 	sec_mod_st * sec;
+	sem_t * sem;
 	int return_code;
 };
 
@@ -901,6 +903,13 @@ void handle_worker_request(void * arg) {
 	}
 	close(connection->cfd);
 	connection->return_code = ret;
+
+	if (connection->sem != NULL) {
+		// Notify that the work is done to unlock next requests.
+		if (sem_post(connection->sem)) {
+			seclog(connection->sec, LOG_ERR, "sec-mod cannot post to connections semaphore");
+		}
+	}
 }
 
 /* sec_mod_server:
@@ -947,8 +956,9 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	vhost_cfg_st *vhost = NULL;
 	fd_set rd_set;
 	struct worker_connection_t connection;
-	int nprocs;
+	int nthreads;
 	threadpool thpool;
+	sem_t connections_sem;
 #ifdef HAVE_PSELECT
 	struct timespec ts;
 #else
@@ -1060,12 +1070,30 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 	seclog(sec, LOG_INFO, "sec-mod initialized (socket: %s)", SOCKET_FILE);
 
 	// Initialize the thread pool with same number of threads as the number of cores of the machine.
-	nprocs = GETCONFIG(sec)->secmod_threads;
-	if (nprocs == 0) {
-		nprocs = get_nprocs();
+	nthreads = GETCONFIG(sec)->secmod_threads;
+	if (nthreads == 0) {
+		nthreads = get_nprocs();
 	}
-	thpool = thpool_init(nprocs);
-	seclog(sec, LOG_INFO, "sec-mod initialized thread pool with %d threads", nprocs);
+
+	if (GETCONFIG(sec)->secmod_max_requests > 0) {
+		ret = sem_init(&connections_sem, PTHREAD_PROCESS_PRIVATE, GETCONFIG(sec)->secmod_max_requests + nthreads);
+		if (ret) {
+			seclog(sec, LOG_ERR, "error initializing connections semaphore: %s", strerror(ret));
+			exit(1);
+		}
+		if (GETCONFIG(sec)->secmod_drop_requests) {
+			seclog(sec, LOG_INFO, "sec-mod allowed to queue %d requests before dropping",
+				   GETCONFIG(sec)->secmod_max_requests);
+		} else {
+			seclog(sec, LOG_INFO, "sec-mod allowed to queue %d requests in buffer before throttling",
+				   GETCONFIG(sec)->secmod_max_requests);
+		}
+	} else {
+		seclog(sec, LOG_INFO, "sec-mod allowed queuing an infinite number of requests");
+	}
+
+	thpool = thpool_init(nthreads);
+	seclog(sec, LOG_INFO, "sec-mod initialized thread pool with %d threads", nthreads);
 
 	for (;;) {
 		check_other_work(sec);
@@ -1145,8 +1173,34 @@ void sec_mod_server(void *main_pool, void *config_pool, struct list_head *vconfi
 			}
 			set_cloexec_flag (cfd, 1);
 
+			if (GETCONFIG(sec)->secmod_max_requests > 0) {
+				// Drop requests policy has been selected, secmod simply drops the request to reduce recovery
+				// time after the attack.
+				if (GETCONFIG(sec)->secmod_drop_requests) {
+					ret = sem_trywait(&connections_sem);
+					if (ret == EAGAIN) {
+						seclog(sec, LOG_ERR,
+							   "sec-mod cannot handle too many concurrent requests, dropping: %s",
+							   strerror(ret));
+						goto cont;
+					}
+				} else {
+					ret = sem_wait(&connections_sem);
+				}
+
+				if (ret) {
+					seclog(sec, LOG_ERR,
+						   "sec-mod cannot wait connections semaphore: %s",
+						   strerror(ret));
+					goto cont;
+				}
+			}
+
 			connection.cfd = cfd;
 			connection.sec = sec;
+			connection.sem = (GETCONFIG(sec)->secmod_max_requests > 0)
+					? &connections_sem
+					: NULL;
 
 			seclog(sec, LOG_DEBUG, "sec-mod distribute request to thread pool");
 			ret = thpool_add_work(thpool, handle_worker_request, (void*)&connection);
